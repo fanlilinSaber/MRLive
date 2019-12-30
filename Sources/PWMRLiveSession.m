@@ -68,7 +68,8 @@ static CMSampleBufferRef u_lastSampleBuffer;
 @property (nonatomic, copy) NSString *pushUrl;
 
 @property (nonatomic) UIBackgroundTaskIdentifier backgroundTask;
-
+/** CADisplayLink */
+@property (nonatomic, strong) CADisplayLink *displayLink;
 @end
 
 @implementation PWMRLiveSession
@@ -280,6 +281,9 @@ static CMSampleBufferRef u_lastSampleBuffer;
                 }];
             }
         });
+    } else {
+        // 释放Timer
+        [self deallocTimer];
     }
 }
 
@@ -531,7 +535,7 @@ static CMSampleBufferRef u_lastSampleBuffer;
     for (id userid in leaveSet) {
         [self onWebRTCUserQuit:userid];
     }
-    // 更新
+   // 更新
     self.userListArray = newUserListArray;
 }
 
@@ -739,7 +743,7 @@ void runOnTheMainQueue(void (^block)(void))
 {
     if (@available(iOS 11.0, *)) {
         runOnTheMainQueue(^{
-           // 取消延时检查录屏状态
+            // 取消延时检查录屏状态
             [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(checkScreenRecorderAndRetry) object:nil];
             // 延时检查录屏状态
             [self performSelector:@selector(checkScreenRecorderAndRetry) withObject:nil afterDelay:3];
@@ -814,6 +818,139 @@ void runOnTheMainQueue(void (^block)(void))
                 }
             }];
         });
+    } else {
+        // ios11以下设备 兼容录屏
+        // 1.创建DisplayLink
+        if (!_displayLink) {
+            self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(drawFrame)];
+            // 设置FPS 30HZ(默认60HZ)
+            if (@available(iOS 10.0, *)) {
+                self.displayLink.preferredFramesPerSecond = 2.0;
+            } else {
+                self.displayLink.frameInterval = 2.0;
+            }
+            [self.displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
+        }
+    }
+}
+
+- (void)drawFrame
+{
+    //2.按频率获取截图
+    UIImage *newImage = [self getScreenShot];
+    //3.image -> CVPixelBufferRef
+    CVPixelBufferRef pixelBuffer = [self pixelBufferFromCGImage:newImage.CGImage];
+    //4.CVPixelBufferRef -> CMSampleBufferRef
+    CMSampleBufferRef sampleBuffer = [self getCMSimpleBufferFromPixelBuffer:pixelBuffer];
+    //5.推流到腾讯直播
+    [self.livePusher sendVideoSampleBuffer:sampleBuffer];
+    //释放资源
+    CFRelease(sampleBuffer);
+}
+
+//获取屏幕截图
+- (UIImage *)getScreenShot
+{
+    @autoreleasepool {
+        UIView *view = nil;
+        view = [self getCurrentActivityViewController].view;
+        //防止资源竞争
+        NSLock *aLock = [NSLock new];
+        [aLock lock];
+        CGSize s = CGSizeMake(view.bounds.size.width, view.bounds.size.height);
+        UIGraphicsBeginImageContextWithOptions(s, NO, 2);
+        [view drawViewHierarchyInRect:view.frame afterScreenUpdates:YES];
+        UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        [aLock unlock];
+        return image;
+    }
+}
+
+//获取当前根视图
+- (UIViewController *)getCurrentActivityViewController
+{
+    UIViewController *result = nil;
+    UIWindow* window = [[[UIApplication sharedApplication] delegate] window];
+    NSAssert(window, @"The Window is Empty....");
+    if (window) {
+        result = window.rootViewController;
+    } else {
+        if (window.windowLevel != UIWindowLevelNormal){
+            NSArray *windows = [[UIApplication sharedApplication] windows];
+            for(UIWindow * tmpWin in windows){
+                if (tmpWin.windowLevel == UIWindowLevelNormal){
+                    window = tmpWin;
+                    break;
+                }
+            }
+        }
+        UIView *frontView = [[window subviews] objectAtIndex:0];
+        id nextResponder = [frontView nextResponder];
+        if ([nextResponder isKindOfClass:[UIViewController class]]){
+            result = nextResponder;
+        }
+    }
+    return result;
+}
+
+//图片转视频流(CVPixelBufferRef)
+- (CVPixelBufferRef)pixelBufferFromCGImage:(CGImageRef)image
+{
+    NSDictionary *options = [NSDictionary dictionaryWithObjectsAndKeys:
+                             [NSNumber numberWithBool:YES], kCVPixelBufferCGImageCompatibilityKey,
+                             [NSNumber numberWithBool:YES], kCVPixelBufferCGBitmapContextCompatibilityKey,
+                             nil];
+    CVPixelBufferRef pxbuffer = NULL;
+    CGFloat frameWidth = CGImageGetWidth(image);
+    CGFloat frameHeight = CGImageGetHeight(image);
+    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault,frameWidth,frameHeight,kCVPixelFormatType_32ARGB,(__bridge CFDictionaryRef) options, &pxbuffer);
+    //
+    NSParameterAssert(status == kCVReturnSuccess && pxbuffer != NULL);
+    CVPixelBufferLockBaseAddress(pxbuffer, 0);
+    void *pxdata = CVPixelBufferGetBaseAddress(pxbuffer);
+    NSParameterAssert(pxdata != NULL);
+    CGColorSpaceRef rgbColorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(pxdata, frameWidth, frameHeight, 8,CVPixelBufferGetBytesPerRow(pxbuffer),rgbColorSpace,(CGBitmapInfo)kCGImageAlphaNoneSkipFirst);
+    //
+    NSParameterAssert(context);
+    CGContextConcatCTM(context, CGAffineTransformIdentity);
+    CGContextDrawImage(context, CGRectMake(0, 0,frameWidth,frameHeight),  image);
+    CGColorSpaceRelease(rgbColorSpace);
+    CGContextRelease(context);
+    CVPixelBufferUnlockBaseAddress(pxbuffer, 0);
+    
+    return pxbuffer;
+}
+
+
+- (CMSampleBufferRef)getCMSimpleBufferFromPixelBuffer:(CVPixelBufferRef )pixelBuffer
+{
+    //不设置具体时间信息
+    CMSampleTimingInfo timing = {kCMTimeInvalid, kCMTimeInvalid, kCMTimeInvalid};
+    //获取视频信息
+    CMVideoFormatDescriptionRef videoInfo = NULL;
+    OSStatus result = CMVideoFormatDescriptionCreateForImageBuffer(NULL, pixelBuffer, &videoInfo);
+    NSParameterAssert(result == 0 && videoInfo != NULL);
+    //
+    CMSampleBufferRef sampleBuffer = NULL;
+    result = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault,pixelBuffer, true, NULL, NULL, videoInfo, &timing, &sampleBuffer);
+    NSParameterAssert(result == 0 && sampleBuffer != NULL);
+    CFRelease(pixelBuffer);
+    CFRelease(videoInfo);
+    //
+    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, YES);
+    CFMutableDictionaryRef dict = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
+    CFDictionarySetValue(dict, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+    return sampleBuffer;
+}
+
+//销毁timer
+- (void)deallocTimer
+{
+    if (self.displayLink) {
+        [self.displayLink invalidate];
+        self.displayLink = nil;
     }
 }
 
